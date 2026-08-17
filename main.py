@@ -19,7 +19,7 @@ import base64
 import tempfile
 
 from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -27,8 +27,11 @@ import db
 import voices
 
 import payments_yoco
+import community_voice
+import dataset_export
 
 db.init_db()
+community_voice.init_community_voice_table(db.get_conn)
 
 app = FastAPI(
     title="CMT Voice Cloud",
@@ -70,6 +73,15 @@ def _check_and_charge(email: str, cost_cents: int, endpoint: str, meta: str = ""
                    f"Top up at https://voicecloud.cmt.africa/billing"
         )
     db.deduct_credits(email, cost_cents, endpoint, meta)
+
+
+def _check_admin_key(x_admin_key: str = Header(...)) -> bool:
+    """Protects the dataset admin endpoints. Set CMT_ADMIN_EXPORT_KEY on
+    Render to any long random string — you'll enter this same string into
+    the admin dashboard page to unlock it. Never hardcode it anywhere."""
+    if x_admin_key != os.environ.get("CMT_ADMIN_EXPORT_KEY"):
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    return True
 
 
 # ── Request models ──────────────────────────────────────────────────────────────
@@ -552,6 +564,15 @@ async def submit_contribution(req: SubmitContributionRequest):
         req.language, req.original_text, req.english_translation, req.audio_base64,
         req.contributor_name, req.contributor_email,
     )
+
+    # Try to grow/rebuild the community voice for this language using the
+    # latest contributions. Non-fatal if it fails (e.g. no ElevenLabs key
+    # set yet, or not enough samples yet) — the contribution is still saved.
+    try:
+        community_voice.rebuild_community_voice(db.get_conn, req.language)
+    except Exception as e:
+        print(f"Community voice rebuild skipped: {e}")
+
     return {"id": new_id, "message": "Thank you! Your contribution has been saved."}
 
 
@@ -571,3 +592,47 @@ async def contribution_stats():
         "total_contributions": stats["total_contributions"],
         "total_contributors": stats["total_contributors"],
     }
+
+
+@app.get("/v1/contribute/community-voice/{language}")
+async def get_community_voice_info(language: str):
+    """Public — check if a language has a working community voice yet."""
+    info = community_voice.get_community_voice(db.get_conn, language)
+    if not info:
+        return {"available": False, "language": language}
+    return {
+        "available": True,
+        "language": language,
+        "sample_count": info["sample_count"],
+        "updated_at": info["updated_at"],
+    }
+
+
+@app.post("/v1/contribute/community-voice/{language}/preview")
+async def preview_community_voice(language: str, text: str = "Sawubona!"):
+    """Public — hear a short preview generated in a language's community voice."""
+    try:
+        audio_bytes = community_voice.speak_with_community_voice(text, language, db.get_conn)
+        return {"audio_base64": base64.b64encode(audio_bytes).decode()}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════
+# ADMIN — dataset summary & export (protected by admin key,
+# never exposed publicly — accessed via the separate admin
+# dashboard, not this public API's normal developer auth)
+# ══════════════════════════════════════════════════════════
+@app.get("/v1/admin/dataset/summary")
+async def dataset_summary(_: bool = Depends(_check_admin_key)):
+    """Per-language contribution counts and date ranges — for the admin dashboard."""
+    return dataset_export.export_summary(db.get_conn)
+
+
+@app.get("/v1/admin/dataset/export")
+async def dataset_export_endpoint(language: str = None, _: bool = Depends(_check_admin_key)):
+    """Download the full dataset (or one language's) as JSONL for training use."""
+    jsonl = dataset_export.export_as_jsonl(db.get_conn, language)
+    return Response(content=jsonl, media_type="application/x-ndjson")

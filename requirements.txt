@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+streamlit>=1.38
+azure-cognitiveservices-speech
+anthropic
+requests
+psycopg2-binary
